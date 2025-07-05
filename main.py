@@ -6,20 +6,20 @@ import git
 from google import genai
 from google.cloud import storage
 from google.genai.types import GenerateContentConfig, Retrieval, Tool, VertexRagStore
-from IPython.display import display, HTML, Markdown
 import vertexai
 from vertexai import rag
 
 
 # @param {"type":"string", "placeholder": "https://github.com/google/adk-python"}
-GITHUB_URL = "https://github.com/google/adk-python"
+# GITHUB_URL = "https://github.com/google/adk-python"
+GITHUB_URL = "https://github.com/rickliujh/mercury"
 # @param {type:"string", placeholder: "[your-project-id]", isTemplate: true}
-PROJECT_ID = "your-project-id"
+PROJECT_ID = "ai-expr-alpha"
 LOCATION = "us-central1"              # @param {type:"string"}
 # @param {type:"string", placeholder: "[your-bucket-name]", isTemplate: true}
-BUCKET_NAME = "your-bucket-name"
+BUCKET_NAME = "code_for_index"
 # @param {type:"string", placeholder: "rag-code-data", isTemplate: true}
-GCS_FOLDER_PATH = "rag-code-data"
+GCS_FOLDER_PATH = "repo1"
 MAX_FILE_SIZE_MB = 10  # @param {type:"number"}
 # @param {type:"string", isTemplate: true}
 EMBEDDING_MODEL = "publishers/google/models/text-embedding-005"
@@ -54,15 +54,15 @@ def main():
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
 
-    if sys.argv[1] == "q":
+    if len(sys.argv) > 1 and sys.argv[1] == "q":
         rag_corpus = "shit"
         tool = create_retrieval_tool(rag_corpus)
         question(client, tool, sys.argv[2])
 
     storage_client = storage.Client(project=PROJECT_ID)
     clone_repo()
-    verify_GCS_access(storage_client)
-    upload_file_GCS()
+    bucket = verify_GCS_access(storage_client)
+    upload_file_GCS(bucket)
     rag_corpus = create_rag_corpus()
     ingest_files_into_corpus(rag_corpus)
     create_retrieval_tool(rag_corpus)
@@ -79,11 +79,12 @@ def verify_GCS_access(storage_client):
     try:
         bucket = storage_client.get_bucket(BUCKET_NAME)
         print(bucket.name)
+        return bucket
     except Exception as e:
         print(f"Error accessing GCS bucket '{BUCKET_NAME}': {e}")
 
 
-def upload_file_GCS():
+def upload_file_GCS(bucket):
     uploaded_file_count = 0
     skipped_file_count = 0
 
@@ -168,11 +169,12 @@ def create_rag_corpus():
             )
         )
     )
-    display(rag_corpus)
+    print(rag_corpus)
     return rag_corpus
 
 
 def ingest_files_into_corpus(rag_corpus):
+    print(GCS_IMPORT_URI)
     import_response = rag.import_files(
         corpus_name=rag_corpus.name,
         paths=[GCS_IMPORT_URI],
@@ -182,8 +184,13 @@ def ingest_files_into_corpus(rag_corpus):
                 chunk_overlap=256
             )
         ),
+        timeout=None,
     )
-    display(import_response)
+    print(import_response.failed_rag_files_count)
+    print(import_response.imported_rag_files_count)
+    print(import_response.skipped_rag_files_count)
+    print(import_response.partial_failures_bigquery_table)
+    print(import_response.partial_failures_gcs_path)
 
 
 def create_retrieval_tool(rag_corpus):
@@ -206,7 +213,7 @@ def question(client, rag_retrieval_tool, q):
         config=GenerateContentConfig(tools=[rag_retrieval_tool]),
     )
 
-    display(Markdown(response.text))
+    print(response.text)
 
 
 if __name__ == "__main__":
