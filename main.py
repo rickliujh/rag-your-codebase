@@ -240,7 +240,7 @@ def ingest_files_info_corpus_v2(rag_corpus, files_gcs_uri):
     print(GCS_IMPORT_URI)
     import_response = rag.import_files(
         corpus_name=rag_corpus.name,
-        paths=files_gcs_uri,
+        paths=[files_gcs_uri],
         transformation_config=rag.TransformationConfig(
             chunking_config=rag.ChunkingConfig(
                 chunk_size=1024,
@@ -342,7 +342,8 @@ def multithreads_ingest_corpus(
         gcs_files, gcs_bucket.name, GCS_FOLDER_PATH, rag_corpus_limit)
 
     for i in range(len(gcs_uris)):
-        print(f"batch ingest_file, No.{i}, {len(gcs_uris) - 1 - i} left...")
+        print(f"No.{i} batch ingest_file, path: {
+              gcs_uris[i]}. {len(gcs_uris) - 1 - i} left...")
         res = ingest_files_info_corpus_v2(rag_corpus, gcs_uris[i])
         print(f" result for No.{i}: failed_rag_files_count: {res.failed_rag_files_count}, imported_rag_files_count:{
               res.imported_rag_files_count}, skipped_rag_files_count: {res.skipped_rag_files_count}")
