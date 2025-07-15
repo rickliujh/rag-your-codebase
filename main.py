@@ -1,6 +1,8 @@
 import os
 import sys
 import uuid
+from typing import List, Tuple, Dict, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import git
 from google import genai
@@ -8,7 +10,6 @@ from google.cloud import storage
 from google.genai.types import GenerateContentConfig, Retrieval, Tool, VertexRagStore
 import vertexai
 from vertexai import rag
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # @param {"type":"string", "placeholder": "https://github.com/google/adk-python"}
@@ -264,7 +265,7 @@ def multithreads_ingest_corpus(
     upload_futures = []
     ingest_futures = []
     gcs_files = []
-    rag_corpus_limit = 25
+    rag_corpus_limit = 5000
     successful_uploads = 0
     failed_uploads = 0
     skipped_uploads = 0
@@ -337,19 +338,118 @@ def multithreads_ingest_corpus(
                 print(f"  File upload generated an exception: {exc}")
                 failed_uploads += 1
 
-    begin_inx = 0
-    times = -(-len(gcs_files)//rag_corpus_limit)  # round up the integer
-    print("times", gcs_files, len(gcs_files), rag_corpus_limit, times)
-    for c in range(times):
-        end_index = begin_inx+rag_corpus_limit
-        end_index = end_index if end_index < len(gcs_files) else len(gcs_files)
-        gcs_files_to_ingest = gcs_files[begin_inx:end_index]
-        begin_inx = end_index
+    gcs_uris = determine_optimal_gcs_ingestion_uris(
+        gcs_files, gcs_bucket.name, GCS_FOLDER_PATH, rag_corpus_limit)
 
-        print(f"batch ingest_file, No.{c}, {times - 1 - c} left...")
-        res = ingest_files_info_corpus_v2(rag_corpus, gcs_files_to_ingest)
-        print(f" result for No.{c}: failed_rag_files_count: {res.failed_rag_files_count}, imported_rag_files_count:{
+    for i in range(len(gcs_uris)):
+        print(f"batch ingest_file, No.{i}, {len(gcs_uris) - 1 - i} left...")
+        res = ingest_files_info_corpus_v2(rag_corpus, gcs_uris[i])
+        print(f" result for No.{i}: failed_rag_files_count: {res.failed_rag_files_count}, imported_rag_files_count:{
               res.imported_rag_files_count}, skipped_rag_files_count: {res.skipped_rag_files_count}")
+
+
+def determine_optimal_gcs_ingestion_uris(
+    all_absolute_gcs_file_paths: List[str],
+    gcs_bucket_name: str,
+    gcs_base_upload_prefix: str,
+    batch_limit: int
+) -> List[str]:
+    """
+    Determines optimal GCS directory URIs (or individual file URIs if a folder doesn't fit the batch)
+    for ingestion, respecting the batch limit and preserving file tree structure.
+
+    Args:
+        all_absolute_gcs_file_paths: A list of all absolute GCS URIs of files to be ingested.
+        gcs_bucket_name: The name of the GCS bucket (e.g., "my-rag-bucket").
+        gcs_base_upload_prefix: The top-level prefix where your codebase resides in GCS
+                                (e.g., "codebase_for_rag/"). This helps scope the prefix generation.
+        batch_limit: The maximum number of files allowed per Vertex AI RAG ingestion request.
+
+    Returns:
+        A list of GCS URIs (either folder URIs ending with '/' or individual file URIs)
+        that are optimized for efficient ingestion into Vertex AI RAG.
+    """
+    optimal_ingestion_uris: List[str] = []
+    processed_gcs_objects: Set[str] = set()
+
+    # Ensure gcs_base_upload_prefix ends with a slash if it's not empty
+    if gcs_base_upload_prefix and not gcs_base_upload_prefix.endswith('/'):
+        gcs_base_upload_prefix += '/'
+
+    # 1. Extract GCS Object Names from absolute URIs
+    all_gcs_object_names: List[str] = []
+    for abs_gcs_path in all_absolute_gcs_file_paths:
+        if abs_gcs_path.startswith(f"gs://{gcs_bucket_name}/"):
+            object_name = abs_gcs_path[len(f"gs://{gcs_bucket_name}/"):]
+            all_gcs_object_names.append(object_name)
+        else:
+            # Handle cases where path might not match the expected bucket, though input implies it should
+            continue
+
+    if not all_gcs_object_names:
+        return []
+
+    # 2. Generate all potential directory prefixes from the GCS object names
+    all_potential_prefixes: Set[str] = set()
+    for obj_name in all_gcs_object_names:
+        parts = obj_name.split('/')
+        # Generate all parent directory prefixes, excluding the file name itself
+        for i in range(len(parts) - 1):  # Iterate up to the parent directory
+            current_prefix = '/'.join(parts[:i+1]) + '/'
+            all_potential_prefixes.add(current_prefix)
+
+    # Add the base upload prefix as a potential starting point
+    all_potential_prefixes.add(gcs_base_upload_prefix)
+
+    # 3. Sort prefixes by length (shortest first) to prioritize higher-level directories
+    sorted_prefixes = sorted(list(all_potential_prefixes), key=len)
+
+    files_to_cover_count = len(all_gcs_object_names)
+    covered_files_count = 0
+
+    # 4. Select Optimal Ingestion URIs
+    for current_prefix in sorted_prefixes:
+        # If all files are already covered, we can stop early
+        if covered_files_count == files_to_cover_count:
+            break
+
+        # Get files under the current prefix that haven't been processed yet
+        files_under_current_prefix = [
+            obj for obj in all_gcs_object_names
+            if obj.startswith(current_prefix) and obj not in processed_gcs_objects
+        ]
+        count = len(files_under_current_prefix)
+
+        if count == 0:
+            continue  # No new files to process under this prefix
+
+        if count <= batch_limit:
+            # This prefix contains a suitable number of files within the limit.
+            # We add the folder URI for efficient ingestion.
+            optimal_ingestion_uris.append(
+                f"gs://{gcs_bucket_name}/{current_prefix}")
+            for obj in files_under_current_prefix:
+                processed_gcs_objects.add(obj)
+            covered_files_count += count
+        else:
+            # This prefix is too large. We don't add it as a whole.
+            # Its sub-prefixes (which are longer) will be considered later in the loop.
+            pass
+
+    # Handle any remaining individual files that weren't part of an optimal folder batch
+    # This can happen if a folder contains a very small number of files that
+    # didn't fit neatly into a larger batch or were left after larger folders were taken.
+    remaining_individual_files = [
+        f"gs://{gcs_bucket_name}/{obj}" for obj in all_gcs_object_names
+        if obj not in processed_gcs_objects
+    ]
+    if remaining_individual_files:
+        # For simplicity, each remaining file is added as an individual ingestion URI.
+        # In a very large scale, you might want to try to batch these small remnants
+        # further, but for RAG's 10k limit, adding individually is often fine.
+        optimal_ingestion_uris.extend(remaining_individual_files)
+
+    return optimal_ingestion_uris
 
 
 def question(client, rag_retrieval_tool, q):
